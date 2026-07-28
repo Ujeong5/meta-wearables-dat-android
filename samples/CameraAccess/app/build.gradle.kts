@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -18,36 +10,55 @@ android {
   namespace = "com.meta.wearable.dat.externalsampleapps.cameraaccess"
   compileSdk = 36
 
-  buildFeatures { buildConfig = true }
+  buildFeatures {
+    buildConfig = true
+  }
 
   defaultConfig {
-    applicationId = "com.meta.wearable.dat.externalsampleapps.cameraaccess"
+    applicationId =
+      "com.meta.wearable.dat.externalsampleapps.cameraaccess"
     minSdk = 31
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"
 
-    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    testInstrumentationRunner =
+      "androidx.test.runner.AndroidJUnitRunner"
 
     // Meta Wearables Device Access Toolkit Setup
-    // Without Developer Mode, these values need to be set with credentials from the app registered
-    // in Wearables Developer Center
-    manifestPlaceholders["mwdat_application_id"] = ""
-    manifestPlaceholders["mwdat_client_token"] = ""
+    manifestPlaceholders["mwdat_application_id"] = "0"
+    manifestPlaceholders["mwdat_client_token"] = "0"
   }
 
   buildTypes {
     release {
       isMinifyEnabled = false
-      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("debug")
+      proguardFiles(
+        getDefaultProguardFile(
+          "proguard-android-optimize.txt",
+        ),
+        "proguard-rules.pro",
+      )
+      signingConfig =
+        signingConfigs.getByName("debug")
     }
   }
+
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
   }
-  packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+
+  androidResources {
+    noCompress += "tflite"
+  }
+
+  packaging {
+    resources {
+      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+  }
+
   signingConfigs {
     getByName("debug") {
       storeFile = file("sample.keystore")
@@ -58,7 +69,11 @@ android {
   }
 }
 
-kotlin { compilerOptions { jvmTarget = JvmTarget.JVM_17 } }
+kotlin {
+  compilerOptions {
+    jvmTarget = JvmTarget.JVM_17
+  }
+}
 
 dependencies {
   implementation(libs.androidx.activity.compose)
@@ -69,10 +84,24 @@ dependencies {
   implementation(libs.androidx.material.icons.extended)
   implementation(libs.androidx.material3)
   implementation(libs.kotlinx.collections.immutable)
+
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.camera)
   implementation(libs.mwdat.mockdevice)
-  implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
+
+  implementation(
+    "com.microsoft.onnxruntime:onnxruntime-android:1.27.0",
+  )
+
+  implementation(
+    "com.google.mediapipe:tasks-vision:0.10.35",
+  )
+
+  // 저장된 JPEG를 multipart/form-data로 데스크톱에 전송한다.
+  implementation(
+    "com.squareup.okhttp3:okhttp:4.12.0",
+  )
+
   androidTestImplementation(libs.androidx.ui.test.junit4)
   androidTestImplementation(libs.androidx.test.uiautomator)
   androidTestImplementation(libs.androidx.test.rules)

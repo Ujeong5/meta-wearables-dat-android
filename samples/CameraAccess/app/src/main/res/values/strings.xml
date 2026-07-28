@@ -78,4 +78,12 @@
     <string name="getting_started_tip_led" description="Tip about capture LED">The capture LED lets others know when you\'re capturing content or going live.</string>
     <string name="getting_started_tip_photo" description="Tip about photo capture">Capture photos by tapping the camera button.</string>
     <string name="getting_started_continue" description="Continue button">Continue</string>
+
+    <string
+        name="mwdat_application_id"
+        translatable="false">0</string>
+
+    <string
+        name="mwdat_client_token"
+        translatable="false">0</string>
 </resources>
