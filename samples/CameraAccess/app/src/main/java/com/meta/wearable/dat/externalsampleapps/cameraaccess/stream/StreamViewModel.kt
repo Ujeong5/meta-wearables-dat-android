@@ -36,6 +36,7 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
@@ -51,8 +52,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 @SuppressLint("AutoCloseableUse")
@@ -69,16 +68,19 @@ class StreamViewModel(
     private val SESSION_TERMINAL_STATES =
       setOf(StreamState.CLOSED)
 
-    // 스트림 프레임의 YOLO 분석 간격
+    /*
+     * 2fps 스트림에 맞춰 최대 500ms마다 최신 프레임에 YOLO를 실행한다.
+     * 추론 중 들어온 프레임은 conflate/isYoloRunning으로 쌓지 않는다.
+     */
     private const val YOLO_INTERVAL_MS = 500L
 
-    // 자동 사진 촬영 요청 사이의 최소 간격
-    //private const val AUTO_CAPTURE_COOLDOWN_MS = 6_000L
-
-    // 유효한 사람 판단 기준
+    /*
+     * 실시간 촬영 후보와 고해상도 저장 후보에 동일하게 적용한다.
+     * 어깨·골반·무릎·발목 중 각 관절 쌍에서 한 점 이상 보여야 통과한다.
+     */
     private const val MIN_PERSON_CONFIDENCE = 0.45f
     private const val MIN_KEYPOINT_CONFIDENCE = 0.35f
-    private const val MIN_BOX_WIDTH_RATIO = 0.08f
+    private const val MIN_BOX_WIDTH_RATIO = 0.05f
     private const val MIN_BOX_HEIGHT_RATIO = 0.20f
 
     // 사람 crop에 추가할 바깥 여백
@@ -86,33 +88,35 @@ class StreamViewModel(
     private const val PERSON_CROP_JPEG_QUALITY = 95
 
     /*
-     * 한 프레임의 순간 오검출로 바로 촬영하지 않도록
-     * 유효한 사람을 연속 2회 확인한 뒤 촬영한다.
+     * 처리 중인 사진까지 포함해 메모리에 유지할 자동 고해상도 사진 수다.
+     * 슬롯이 가득 차면 이미 촬영한 사진을 버리는 대신 새 촬영 요청만 잠시 보류한다.
      */
-    private const val REQUIRED_CONSECUTIVE_VALID_DETECTIONS = 2
-
-    /*
-     * 같은 사람을 반복 촬영하지 않는다.
-     * 사람이 연속 3회 사라진 뒤에만 다음 자동 촬영을 허용한다.
-     */
-    private const val REQUIRED_CONSECUTIVE_EMPTY_DETECTIONS_TO_REARM = 3
-
-    /*
-     * 고해상도 Bitmap이 메모리에 무제한 쌓이는 것을 방지한다.
-     * 현재 처리 중인 사진과 대기 중인 사진을 합쳐 최대 2장만 유지한다.
-     */
-    private const val MAX_PENDING_PHOTO_PROCESSING = 2
+    private const val MAX_PENDING_AUTO_PHOTOS = 3
   }
 
-  private val yoloPoseModel =
+  /*
+   * 실시간 스트림과 고해상도 사진이 서로 YOLO 사용권을 기다리지 않도록
+   * ONNX Runtime 세션을 두 개 분리한다.
+   */
+  private val realtimeYoloPoseModel =
+    YoloPoseModel(getApplication())
+
+  private val highResYoloPoseModel =
     YoloPoseModel(getApplication())
 
   /*
-   * 사람 crop에서 얼굴을 검출하고 모자이크한다.
-   * 얼굴을 찾지 못하면 privacy fallback으로 crop 상단의 머리 영역을 모자이크한다.
+   * Face Landmarker로 눈·코·입 중심부만 모자이크한다.
+   * 얼굴이 검출되지 않는 뒷모습에는 모자이크를 적용하지 않는다.
    */
-  private val faceMosaicProcessor =
-    FaceMosaicProcessor(getApplication())
+  private val faceLandmarkMosaicProcessor =
+    FaceLandmarkMosaicProcessor(getApplication())
+
+  /*
+   * 익명화된 사람 crop에서 OSNet 특징을 추출하고,
+   * 이미 저장한 사람과 중복인지 판단한다.
+   */
+  private val osNetReIdentifier =
+    OsNetReIdentifier(getApplication())
 
   // 저장된 모자이크 crop 전체를 데스크톱으로 전송한다.
   private val batchCropUploader =
@@ -149,46 +153,50 @@ class StreamViewModel(
     null
 
   /*
-   * 촬영된 사진의 처리 작업들을 보관한다.
-   * 사진 촬영과 이전 사진의 YOLO/crop/저장을 병렬로 진행할 수 있다.
+   * 수동 촬영 후 공유 화면으로 넘기는 작업들을 보관한다.
+   * 자동 촬영 사진은 아래의 단일 순차 처리 큐에서 관리한다.
    */
   private val photoProcessingJobs =
     mutableSetOf<Job>()
 
-  // 처리 중이거나 대기 중인 고해상도 사진 수다.
-  private val pendingPhotoProcessingCount =
+  /*
+   * 자동 촬영 사진 처리 대기열.
+   *
+   * 촬영은 이전 사진의 후처리와 병렬로 진행할 수 있지만,
+   * YOLO → Face Landmarker → OSNet → 저장은 한 장씩 순서대로 실행한다.
+   * 이렇게 해야 같은 사람이 연속 사진에서 동시에 신규로 판정되는 문제를 줄일 수 있다.
+   */
+  private val autoPhotoQueueLock =
+    Any()
+
+  private val autoPhotoQueue =
+    ArrayDeque<Bitmap>()
+
+  private var autoPhotoProcessorJob: Job? =
+    null
+
+  /*
+   * 현재 촬영 예약, 처리 대기, 처리 중인 자동 사진의 총합이다.
+   * 이 값이 MAX_PENDING_AUTO_PHOTOS에 도달하면 새 촬영만 잠시 보류한다.
+   */
+  private val pendingAutoPhotoCount =
     AtomicInteger(0)
 
   /*
-   * 스트림 YOLO와 고해상도 사진 YOLO가 같은 모델을 동시에 사용하지 않도록 한다.
-   * 고해상도 사진 YOLO가 끝나면 lock이 풀리므로,
-   * 이전 사진의 JPEG 저장과 다음 스트림 YOLO는 겹쳐서 실행될 수 있다.
+   * 자동 촬영 간격을 실제로 측정하기 위한 단조 증가 시각이다.
+   * 코드에서 6초를 강제하지 않고, 요청·성공 간격을 Logcat에 기록한다.
    */
-  private val yoloMutex =
-    Mutex()
-
-  // 고해상도 사진 YOLO를 기다리거나 실행 중인 작업 수다.
-  private val highResYoloDemandCount =
-    AtomicInteger(0)
-
-  // 마지막 자동 촬영 요청 시각
-  private var lastAutoCaptureRequestedAtMs =
+  private var lastAutoCaptureRequestAtMs =
     0L
 
-  // 유효한 사람이 연속으로 검출된 횟수다.
-  private var consecutiveValidDetectionCount =
-    0
+  private var lastAutoCaptureSuccessAtMs =
+    0L
 
-  // 유효한 사람이 연속으로 검출되지 않은 횟수다.
-  private var consecutiveEmptyDetectionCount =
-    0
+  private val autoCaptureAttemptCount =
+    AtomicInteger(0)
 
-  /*
-   * true일 때만 자동 촬영할 수 있다.
-   * 한 번 촬영한 뒤 사람이 화면에서 사라질 때까지 false로 유지한다.
-   */
-  private var autoCaptureArmed =
-    true
+  private val autoCaptureSuccessCount =
+    AtomicInteger(0)
 
   // 가장 최근 프레임의 유효한 사람 검출 결과다.
   @Volatile
@@ -272,19 +280,18 @@ class StreamViewModel(
     photoCaptureJob = null
 
     cancelPhotoProcessingJobs()
+    cancelAutoPhotoProcessingQueue()
 
     isYoloRunning.set(false)
     isPhotoCaptureRunning.set(false)
 
-    pendingPhotoProcessingCount.set(0)
-    highResYoloDemandCount.set(0)
+    pendingAutoPhotoCount.set(0)
 
     lastYoloStartedAtMs = 0L
-    lastAutoCaptureRequestedAtMs = 0L
-
-    consecutiveValidDetectionCount = 0
-    consecutiveEmptyDetectionCount = 0
-    autoCaptureArmed = true
+    lastAutoCaptureRequestAtMs = 0L
+    lastAutoCaptureSuccessAtMs = 0L
+    autoCaptureAttemptCount.set(0)
+    autoCaptureSuccessCount.set(0)
 
     latestDetections = emptyList()
     latestDetectionWidth = 0
@@ -395,8 +402,8 @@ class StreamViewModel(
             session
               ?.addStream(
                 StreamConfiguration(
-                  videoQuality = VideoQuality.MEDIUM,
-                  frameRate = 24,
+                  videoQuality = VideoQuality.HIGH,
+                  frameRate = 2,
                 ),
               )
               ?.onSuccess { addedStream ->
@@ -546,12 +553,12 @@ class StreamViewModel(
     photoCaptureJob = null
 
     cancelPhotoProcessingJobs()
+    cancelAutoPhotoProcessingQueue()
 
     isYoloRunning.set(false)
     isPhotoCaptureRunning.set(false)
 
-    pendingPhotoProcessingCount.set(0)
-    highResYoloDemandCount.set(0)
+    pendingAutoPhotoCount.set(0)
 
     resetDetectionState()
 
@@ -645,22 +652,41 @@ class StreamViewModel(
             finishPhotoCapture()
           }
 
-          // 촬영 완료 후 생성된 crop/모자이크/저장 작업까지 기다린다.
+          /*
+           * 자동 촬영 큐는 한 장씩 순서대로 처리한다.
+           * 최대 3장만 유지하므로, 중지 시 큐 전체가 끝날 때까지 기다린다.
+           */
+          val autoProcessingCompleted =
+            withTimeoutOrNull(180_000L) {
+              autoPhotoProcessorJob?.join()
+              true
+            } ?: false
+
+          if (!autoProcessingCompleted) {
+            Log.w(
+              TAG,
+              "Automatic photo queue did not finish before upload timeout",
+            )
+
+            cancelAutoPhotoProcessingQueue()
+          }
+
+          // 수동 촬영 후처리 작업도 기다린다.
           val processingJobs =
             synchronized(photoProcessingJobs) {
               photoProcessingJobs.toList()
             }
 
-          val processingCompleted =
-            withTimeoutOrNull(90_000L) {
+          val manualProcessingCompleted =
+            withTimeoutOrNull(30_000L) {
               processingJobs.joinAll()
               true
             } ?: false
 
-          if (!processingCompleted) {
+          if (!manualProcessingCompleted) {
             Log.w(
               TAG,
-              "Photo processing did not finish before upload timeout",
+              "Manual photo processing did not finish before upload timeout",
             )
 
             processingJobs.forEach { job ->
@@ -669,9 +695,8 @@ class StreamViewModel(
             processingJobs.joinAll()
           }
 
-          pendingPhotoProcessingCount.set(0)
-          highResYoloDemandCount.set(0)
           isPhotoCaptureRunning.set(false)
+          pendingAutoPhotoCount.set(0)
 
           closeStreamSessionForUpload()
 
@@ -848,11 +873,10 @@ class StreamViewModel(
 
   private fun resetDetectionState() {
     lastYoloStartedAtMs = 0L
-    lastAutoCaptureRequestedAtMs = 0L
-
-    consecutiveValidDetectionCount = 0
-    consecutiveEmptyDetectionCount = 0
-    autoCaptureArmed = true
+    lastAutoCaptureRequestAtMs = 0L
+    lastAutoCaptureSuccessAtMs = 0L
+    autoCaptureAttemptCount.set(0)
+    autoCaptureSuccessCount.set(0)
 
     latestDetections = emptyList()
     latestDetectionWidth = 0
@@ -946,20 +970,31 @@ class StreamViewModel(
       return
     }
 
-    val currentTime =
-      SystemClock.elapsedRealtime()
+    /*
+     * 자동 사진은 처리 중인 사진까지 포함해 최대 3장만 유지한다.
+     * 큐가 가득 차면 이미 촬영한 사진을 버리지 않고 새 촬영 요청만 보류한다.
+     */
+    val autoSlotReserved =
+      if (isAutomatic) {
+        tryReserveAutoPhotoSlot()
+      } else {
+        false
+      }
 
-    /*if (
-      isAutomatic &&
-      currentTime - lastAutoCaptureRequestedAtMs <
-      AUTO_CAPTURE_COOLDOWN_MS
-    ) {
+    if (isAutomatic && !autoSlotReserved) {
+      Log.d(
+        TAG,
+        "Automatic capture skipped: " +
+                "photo queue is full " +
+                "(${pendingAutoPhotoCount.get()}/$MAX_PENDING_AUTO_PHOTOS)",
+      )
       return
-    }*/
+    }
 
     /*
      * 실제 capturePhoto() 호출끼리만 겹치지 않게 막는다.
-     * 이전 사진의 YOLO/crop/저장이 실행 중이어도 다음 사진 촬영은 가능하다.
+     * 이전 사진의 YOLO, Face Landmarker, OSNet, 저장이 실행 중이어도
+     * 큐 슬롯이 남아 있으면 다음 사진 촬영을 시작할 수 있다.
      */
     if (
       !isPhotoCaptureRunning.compareAndSet(
@@ -967,6 +1002,10 @@ class StreamViewModel(
         true,
       )
     ) {
+      if (autoSlotReserved) {
+        releaseAutoPhotoSlot()
+      }
+
       Log.d(
         TAG,
         "Photo capture already running, ignoring request",
@@ -979,23 +1018,50 @@ class StreamViewModel(
 
     if (activeStream == null) {
       finishPhotoCapture()
+
+      if (autoSlotReserved) {
+        releaseAutoPhotoSlot()
+      }
       return
     }
 
-    if (isAutomatic) {
-      lastAutoCaptureRequestedAtMs =
-        currentTime
+    val requestStartedAtMs =
+      SystemClock.elapsedRealtime()
 
-      Log.d(
-        TAG,
-        "Automatic high-resolution photo capture requested",
-      )
-    } else {
-      Log.d(
-        TAG,
-        "Manual photo capture requested",
-      )
+    val attemptNumber =
+      if (isAutomatic) {
+        autoCaptureAttemptCount.incrementAndGet()
+      } else {
+        0
+      }
+
+    val requestToRequestMs =
+      if (
+        isAutomatic &&
+        lastAutoCaptureRequestAtMs > 0L
+      ) {
+        requestStartedAtMs -
+                lastAutoCaptureRequestAtMs
+      } else {
+        -1L
+      }
+
+    if (isAutomatic) {
+      lastAutoCaptureRequestAtMs =
+        requestStartedAtMs
     }
+
+    Log.d(
+      TAG,
+      if (isAutomatic) {
+        "AUTO_CAPTURE_REQUEST: " +
+                "attempt=$attemptNumber, " +
+                "requestToRequestMs=$requestToRequestMs, " +
+                "pending=${pendingAutoPhotoCount.get()}/$MAX_PENDING_AUTO_PHOTOS"
+      } else {
+        "Manual photo capture requested"
+      },
+    )
 
     _uiState.update {
       it.copy(isCapturing = true)
@@ -1008,10 +1074,6 @@ class StreamViewModel(
           .onSuccess { photoData ->
             val capturedBitmap =
               try {
-                /*
-                 * SDK가 제공한 PhotoData에서 독립적인 Bitmap을 만든다.
-                 * 이 복사가 끝나는 즉시 촬영 lock을 해제한다.
-                 */
                 copyPhotoDataToBitmap(
                   photoData,
                 )
@@ -1023,14 +1085,54 @@ class StreamViewModel(
                 )
 
                 finishPhotoCapture()
+
+                if (autoSlotReserved) {
+                  releaseAutoPhotoSlot()
+                }
                 return@onSuccess
               }
+
+            val successAtMs =
+              SystemClock.elapsedRealtime()
+
+            val requestToSuccessMs =
+              successAtMs -
+                      requestStartedAtMs
+
+            val successToSuccessMs =
+              if (
+                isAutomatic &&
+                lastAutoCaptureSuccessAtMs > 0L
+              ) {
+                successAtMs -
+                        lastAutoCaptureSuccessAtMs
+              } else {
+                -1L
+              }
+
+            val successNumber =
+              if (isAutomatic) {
+                autoCaptureSuccessCount.incrementAndGet()
+              } else {
+                0
+              }
+
+            if (isAutomatic) {
+              lastAutoCaptureSuccessAtMs =
+                successAtMs
+            }
 
             Log.d(
               TAG,
               if (isAutomatic) {
-                "Automatic photo capture successful: " +
-                        "${capturedBitmap.width}x${capturedBitmap.height}"
+                "AUTO_CAPTURE_SUCCESS: " +
+                        "success=$successNumber, " +
+                        "attempt=$attemptNumber, " +
+                        "requestToSuccessMs=$requestToSuccessMs, " +
+                        "successToSuccessMs=$successToSuccessMs, " +
+                        "size=${capturedBitmap.width}x${capturedBitmap.height}, " +
+                        "bitmapBytes=${capturedBitmap.allocationByteCount}, " +
+                        "pending=${pendingAutoPhotoCount.get()}/$MAX_PENDING_AUTO_PHOTOS"
               } else {
                 "Manual photo capture successful: " +
                         "${capturedBitmap.width}x${capturedBitmap.height}"
@@ -1038,23 +1140,43 @@ class StreamViewModel(
             )
 
             /*
-             * 여기서 촬영 lock을 먼저 해제한다.
-             * 이후 YOLO/crop/저장은 별도 작업에서 계속된다.
+             * PhotoData를 독립적인 Bitmap으로 복사한 순간
+             * 촬영 API 잠금을 해제한다.
+             * 이후 고해상도 처리는 자동 사진 큐에서 별도로 진행된다.
              */
             finishPhotoCapture()
 
-            launchCapturedPhotoProcessing(
-              capturedBitmap = capturedBitmap,
-              isAutomatic = isAutomatic,
-            )
+            if (isAutomatic) {
+              enqueueAutoCapturedPhoto(
+                capturedBitmap = capturedBitmap,
+              )
+            } else {
+              launchManualCapturedPhotoProcessing(
+                capturedBitmap = capturedBitmap,
+              )
+            }
           }
           .onFailure { error, _ ->
+            val failedAtMs =
+              SystemClock.elapsedRealtime()
+
             Log.e(
               TAG,
-              "Photo capture failed: ${error.description}",
+              if (isAutomatic) {
+                "AUTO_CAPTURE_FAILURE: " +
+                        "attempt=$attemptNumber, " +
+                        "requestToFailureMs=${failedAtMs - requestStartedAtMs}, " +
+                        "error=${error.description}"
+              } else {
+                "Photo capture failed: ${error.description}"
+              },
             )
 
             finishPhotoCapture()
+
+            if (autoSlotReserved) {
+              releaseAutoPhotoSlot()
+            }
           }
       }
   }
@@ -1067,54 +1189,149 @@ class StreamViewModel(
     isPhotoCaptureRunning.set(false)
   }
 
-  private fun launchCapturedPhotoProcessing(
+  /*
+   * 자동 촬영 사진을 메모리 큐에 추가한다.
+   * 슬롯은 촬영 요청 전에 이미 예약되었으므로 여기서는 사진을 버리지 않는다.
+   */
+  private fun enqueueAutoCapturedPhoto(
     capturedBitmap: Bitmap,
-    isAutomatic: Boolean,
   ) {
-    while (true) {
-      val currentCount =
-        pendingPhotoProcessingCount.get()
-
-      if (
-        currentCount >=
-        MAX_PENDING_PHOTO_PROCESSING
-      ) {
-        Log.w(
-          TAG,
-          "Photo processing queue is full; dropping captured photo",
+    val queueSize =
+      synchronized(autoPhotoQueueLock) {
+        autoPhotoQueue.addLast(
+          capturedBitmap,
         )
 
-        if (!capturedBitmap.isRecycled) {
-          capturedBitmap.recycle()
-        }
+        autoPhotoQueue.size
+      }
+
+    Log.d(
+      TAG,
+      "Automatic photo queued: " +
+              "queueSize=$queueSize, " +
+              "pending=${pendingAutoPhotoCount.get()}/$MAX_PENDING_AUTO_PHOTOS",
+    )
+
+    startAutoPhotoProcessorIfNeeded()
+  }
+
+  /*
+   * 자동 사진은 반드시 한 장씩 순서대로 처리한다.
+   * 촬영은 이 작업과 병렬로 계속 진행할 수 있다.
+   */
+  private fun startAutoPhotoProcessorIfNeeded() {
+    val jobToStart: Job?
+
+    synchronized(autoPhotoQueueLock) {
+      if (
+        autoPhotoProcessorJob?.isActive ==
+        true
+      ) {
         return
       }
 
-      if (
-        pendingPhotoProcessingCount.compareAndSet(
-          currentCount,
-          currentCount + 1,
-        )
-      ) {
-        break
+      if (autoPhotoQueue.isEmpty()) {
+        return
       }
+
+      val newJob =
+        viewModelScope.launch(
+          context = Dispatchers.Default,
+          start = CoroutineStart.LAZY,
+        ) {
+          while (true) {
+            val nextPhoto =
+              synchronized(autoPhotoQueueLock) {
+                if (autoPhotoQueue.isEmpty()) {
+                  null
+                } else {
+                  autoPhotoQueue.removeFirst()
+                }
+              } ?: break
+
+            try {
+              processAutoCapturedPhoto(
+                fullPhoto = nextPhoto,
+              )
+            } catch (
+              exception: CancellationException
+            ) {
+              if (!nextPhoto.isRecycled) {
+                nextPhoto.recycle()
+              }
+
+              throw exception
+            } catch (
+              exception: Exception
+            ) {
+              Log.e(
+                TAG,
+                "Automatic photo processing failed",
+                exception,
+              )
+
+              if (!nextPhoto.isRecycled) {
+                nextPhoto.recycle()
+              }
+            } finally {
+              releaseAutoPhotoSlot()
+
+              Log.d(
+                TAG,
+                "Automatic photo slot released: " +
+                        "pending=${pendingAutoPhotoCount.get()}/$MAX_PENDING_AUTO_PHOTOS",
+              )
+            }
+          }
+        }
+
+      autoPhotoProcessorJob =
+        newJob
+
+      newJob.invokeOnCompletion {
+        var shouldRestart =
+          false
+
+        synchronized(autoPhotoQueueLock) {
+          if (
+            autoPhotoProcessorJob ===
+            newJob
+          ) {
+            autoPhotoProcessorJob =
+              null
+          }
+
+          shouldRestart =
+            autoPhotoQueue.isNotEmpty()
+        }
+
+        if (shouldRestart) {
+          startAutoPhotoProcessorIfNeeded()
+        }
+      }
+
+      jobToStart =
+        newJob
     }
 
+    jobToStart?.start()
+  }
+
+  /*
+   * 수동 촬영은 기존 공유 다이얼로그 동작을 유지한다.
+   */
+  private fun launchManualCapturedPhotoProcessing(
+    capturedBitmap: Bitmap,
+  ) {
     val processingJob =
       viewModelScope.launch(
         context = Dispatchers.Default,
         start = CoroutineStart.LAZY,
       ) {
         try {
-          if (isAutomatic) {
-            processAutoCapturedPhoto(
-              fullPhoto = capturedBitmap,
-            )
-          } else {
-            processManualCapturedPhoto(
-              capturedPhoto = capturedBitmap,
-            )
-          }
+          processManualCapturedPhoto(
+            capturedPhoto = capturedBitmap,
+          )
         } catch (
           exception: CancellationException
         ) {
@@ -1128,17 +1345,13 @@ class StreamViewModel(
         ) {
           Log.e(
             TAG,
-            "Captured photo processing failed",
+            "Manual photo processing failed",
             exception,
           )
 
           if (!capturedBitmap.isRecycled) {
             capturedBitmap.recycle()
           }
-        } finally {
-          decrementAtomicNonNegative(
-            pendingPhotoProcessingCount,
-          )
         }
       }
 
@@ -1157,6 +1370,35 @@ class StreamViewModel(
     }
 
     processingJob.start()
+  }
+
+  private fun tryReserveAutoPhotoSlot(): Boolean {
+    while (true) {
+      val currentCount =
+        pendingAutoPhotoCount.get()
+
+      if (
+        currentCount >=
+        MAX_PENDING_AUTO_PHOTOS
+      ) {
+        return false
+      }
+
+      if (
+        pendingAutoPhotoCount.compareAndSet(
+          currentCount,
+          currentCount + 1,
+        )
+      ) {
+        return true
+      }
+    }
+  }
+
+  private fun releaseAutoPhotoSlot() {
+    decrementAtomicNonNegative(
+      pendingAutoPhotoCount,
+    )
   }
 
   private fun decrementAtomicNonNegative(
@@ -1194,6 +1436,36 @@ class StreamViewModel(
     jobsToCancel.forEach { job ->
       job.cancel()
     }
+  }
+
+
+  private fun cancelAutoPhotoProcessingQueue() {
+    autoPhotoProcessorJob?.cancel()
+    autoPhotoProcessorJob = null
+
+    val queuedPhotos =
+      synchronized(autoPhotoQueueLock) {
+        buildList {
+          while (autoPhotoQueue.isNotEmpty()) {
+            add(
+              autoPhotoQueue.removeFirst(),
+            )
+          }
+        }
+      }
+
+    queuedPhotos.forEach { bitmap ->
+      if (!bitmap.isRecycled) {
+        bitmap.recycle()
+      }
+    }
+
+    pendingAutoPhotoCount.set(0)
+
+    Log.d(
+      TAG,
+      "Automatic photo processing queue cancelled and cleared",
+    )
   }
 
   fun showShareDialog() {
@@ -1313,16 +1585,6 @@ class StreamViewModel(
       return
     }
 
-    /*
-     * 고해상도 사진 YOLO가 기다리거나 실행 중이면
-     * 스트림 YOLO를 잠시 건너뛰어 고해상도 처리를 우선한다.
-     *
-     * 사진 촬영 자체와 crop 저장 중에는 스트림 YOLO가 계속 가능하다.
-     */
-    if (highResYoloDemandCount.get() > 0) {
-      return
-    }
-
     val currentTime =
       SystemClock.elapsedRealtime()
 
@@ -1363,34 +1625,16 @@ class StreamViewModel(
 
     yoloJob =
       viewModelScope.launch(Dispatchers.Default) {
-        val totalStartTime =
+        val startedAtMs =
           SystemClock.elapsedRealtime()
-
-        var yoloLockAcquired =
-          false
 
         try {
           /*
-           * 다른 YOLO가 모델을 사용 중이면 이 스트림 프레임은 버린다.
-           * 스트림 프레임을 대기열에 쌓지 않기 위한 동작이다.
+           * 고해상도 사진은 별도의 YOLO 세션을 사용하므로,
+           * 실시간 검출이 사진 후처리 때문에 대기하거나 굶지 않는다.
            */
-          yoloLockAcquired =
-            yoloMutex.tryLock()
-
-          if (!yoloLockAcquired) {
-            return@launch
-          }
-
-          /*
-           * lock을 얻는 순간 고해상도 YOLO 요청이 생겼다면
-           * 이 스트림 추론을 취소하고 lock을 넘긴다.
-           */
-          if (highResYoloDemandCount.get() > 0) {
-            return@launch
-          }
-
           val rawDetections =
-            yoloPoseModel.detect(
+            realtimeYoloPoseModel.detect(
               inferenceBitmap,
             )
 
@@ -1410,14 +1654,14 @@ class StreamViewModel(
           latestDetectionHeight =
             inferenceBitmap.height
 
-          val totalElapsedTime =
+          val elapsedMs =
             SystemClock.elapsedRealtime() -
-                    totalStartTime
+                    startedAtMs
 
           Log.d(
             TAG,
-            "Realtime YOLO: " +
-                    "total=${totalElapsedTime}ms, " +
+            "REALTIME_YOLO_RESULT: " +
+                    "elapsedMs=$elapsedMs, " +
                     "raw=${rawDetections.size}, " +
                     "valid=${validDetections.size}",
           )
@@ -1438,10 +1682,6 @@ class StreamViewModel(
             exception,
           )
         } finally {
-          if (yoloLockAcquired) {
-            yoloMutex.unlock()
-          }
-
           inferenceBitmap.recycle()
           isYoloRunning.set(false)
         }
@@ -1449,64 +1689,15 @@ class StreamViewModel(
   }
 
   /*
-   * 순간 오검출과 같은 사람의 반복 촬영을 막는다.
-   *
-   * 1. 유효한 사람을 연속 2회 확인해야 촬영한다.
-   * 2. 촬영 후에는 자동 촬영을 잠근다.
-   * 3. 사람이 연속 3회 사라져야 다시 촬영 가능 상태가 된다.
+   * 첫 번째 OSNet은 사용하지 않는다.
+   * 실시간 스트림에서 어깨·골반·무릎·발목 조건까지 통과한 사람이
+   * 한 명 이상이면 고해상도 사진 촬영을 요청한다.
    */
   private fun updateAutoCaptureState(
     validDetections: List<PoseDetection>,
   ) {
     if (validDetections.isNotEmpty()) {
-      consecutiveEmptyDetectionCount = 0
-
-      if (!autoCaptureArmed) {
-        consecutiveValidDetectionCount = 0
-        return
-      }
-
-      consecutiveValidDetectionCount += 1
-
-      if (
-        consecutiveValidDetectionCount <
-        REQUIRED_CONSECUTIVE_VALID_DETECTIONS
-      ) {
-        return
-      }
-
-      autoCaptureArmed = false
-      consecutiveValidDetectionCount = 0
-
-      Log.d(
-        TAG,
-        "Stable person detection confirmed; auto capture armed -> locked",
-      )
-
       requestAutoPhotoCapture()
-      return
-    }
-
-    consecutiveValidDetectionCount = 0
-
-    if (autoCaptureArmed) {
-      consecutiveEmptyDetectionCount = 0
-      return
-    }
-
-    consecutiveEmptyDetectionCount += 1
-
-    if (
-      consecutiveEmptyDetectionCount >=
-      REQUIRED_CONSECUTIVE_EMPTY_DETECTIONS_TO_REARM
-    ) {
-      consecutiveEmptyDetectionCount = 0
-      autoCaptureArmed = true
-
-      Log.d(
-        TAG,
-        "Person disappearance confirmed; automatic capture re-armed",
-      )
     }
   }
 
@@ -1538,65 +1729,39 @@ class StreamViewModel(
         return@filter false
       }
 
-      // COCO Pose: 5/6은 어깨, 11/12는 골반이다.
-      val leftShoulder =
-        detection.keypoints
-          .getOrNull(5)
+      // COCO Pose index: 어깨 5/6, 골반 11/12, 무릎 13/14, 발목 15/16.
+      fun keypointConfidence(index: Int): Float {
+        return detection.keypoints
+          .getOrNull(index)
           ?.confidence
           ?: 0f
+      }
 
-      val rightShoulder =
-        detection.keypoints
-          .getOrNull(6)
-          ?.confidence
-          ?: 0f
+      val shoulderVisible =
+        keypointConfidence(5) >= MIN_KEYPOINT_CONFIDENCE ||
+                keypointConfidence(6) >= MIN_KEYPOINT_CONFIDENCE
 
-      val leftHip =
-        detection.keypoints
-          .getOrNull(11)
-          ?.confidence
-          ?: 0f
+      val hipVisible =
+        keypointConfidence(11) >= MIN_KEYPOINT_CONFIDENCE ||
+                keypointConfidence(12) >= MIN_KEYPOINT_CONFIDENCE
 
-      val rightHip =
-        detection.keypoints
-          .getOrNull(12)
-          ?.confidence
-          ?: 0f
+      val kneeVisible =
+        keypointConfidence(13) >= MIN_KEYPOINT_CONFIDENCE ||
+                keypointConfidence(14) >= MIN_KEYPOINT_CONFIDENCE
 
-      val visibleShoulderCount =
-        listOf(
-          leftShoulder,
-          rightShoulder,
-        ).count {
-          it >= MIN_KEYPOINT_CONFIDENCE
-        }
+      val ankleVisible =
+        keypointConfidence(15) >= MIN_KEYPOINT_CONFIDENCE ||
+                keypointConfidence(16) >= MIN_KEYPOINT_CONFIDENCE
 
-      val visibleHipCount =
-        listOf(
-          leftHip,
-          rightHip,
-        ).count {
-          it >= MIN_KEYPOINT_CONFIDENCE
-        }
-
-      val visibleTorsoPointCount =
-        listOf(
-          leftShoulder,
-          rightShoulder,
-          leftHip,
-          rightHip,
-        ).count {
-          it >= MIN_KEYPOINT_CONFIDENCE
-        }
-
-      visibleShoulderCount >= 1 &&
-              visibleHipCount >= 1 &&
-              visibleTorsoPointCount >= 3
+      shoulderVisible &&
+              hipVisible &&
+              kneeVisible &&
+              ankleVisible
     }
   }
 
   /*
-   * 휴대폰 미리보기 Bitmap에 유효한 사람의 Bounding Box만 그린다.
+   * 휴대폰 미리보기 Bitmap에 전신 조건을 통과한 사람의 Bounding Box만 그린다.
    * person 글자, 신뢰도 퍼센트, 관절점, skeleton 선은 표시하지 않는다.
    */
   private fun drawLatestDetectionsInPlace(
@@ -1641,14 +1806,13 @@ class StreamViewModel(
   }
 
   /*
-   * 자동 촬영된 고해상도 사진:
-   * 1. 고해상도 YOLO는 한 번에 하나씩 실행
-   * 2. 유효한 사람 중 Bounding Box가 가장 큰 한 명 선택
-   * 3. 사람 영역 crop
-   * 4. JPEG 저장
-   *
-   * YOLO lock은 검출 직후 해제하므로,
-   * 이 사진의 crop 저장과 다음 사진의 YOLO는 겹쳐서 실행될 수 있다.
+   * 자동 촬영된 고해상도 사진 처리:
+   * 1. 사진 전체에 YOLO11n-pose를 다시 실행한다.
+   * 2. 전신·크기 조건을 통과한 모든 사람을 각각 crop한다.
+   * 3. Face Landmarker로 눈·코·입만 모자이크한다.
+   * 4. 익명화된 crop에서 OSNet embedding을 추출한다.
+   * 5. 이미 저장한 사람은 제외하고 신규 인물만 JPEG로 저장한다.
+   * 6. 저장 성공 후에만 OSNet gallery에 등록한다.
    */
   private suspend fun processAutoCapturedPhoto(
     fullPhoto: Bitmap,
@@ -1660,21 +1824,14 @@ class StreamViewModel(
                 "${fullPhoto.width}x${fullPhoto.height}",
       )
 
-      highResYoloDemandCount
-        .incrementAndGet()
-
+      /*
+       * 고해상도 사진은 실시간 스트림과 별도의 YOLO 세션으로 처리한다.
+       * 따라서 사진 후처리 중에도 실시간 박스와 촬영 트리거가 계속 갱신된다.
+       */
       val rawDetections =
-        try {
-          yoloMutex.withLock {
-            yoloPoseModel.detect(
-              fullPhoto,
-            )
-          }
-        } finally {
-          decrementAtomicNonNegative(
-            highResYoloDemandCount,
-          )
-        }
+        highResYoloPoseModel.detect(
+          fullPhoto,
+        )
 
       val validDetections =
         filterValidPersonDetections(
@@ -1690,66 +1847,145 @@ class StreamViewModel(
                 "valid=${validDetections.size}",
       )
 
-      val targetPerson =
-        selectLargestPerson(
-          detections = validDetections,
-        )
-
-      if (targetPerson == null) {
+      if (validDetections.isEmpty()) {
         Log.d(
           TAG,
-          "No valid person remained in high-resolution photo",
+          "No valid full-body person remained in high-resolution photo",
         )
         return
       }
 
-      val personCrop =
-        cropPersonBitmap(
-          sourceBitmap = fullPhoto,
-          detection = targetPerson,
-        )
+      val captureId =
+        System.currentTimeMillis()
 
-      try {
-        /*
-         * 저장 전에 사람 crop 내부의 얼굴을 검출하고 모자이크한다.
-         * 얼굴 검출이 0개이면 crop 상단 머리 영역에 fallback 모자이크를 적용한다.
-         */
-        val mosaicResult =
-          faceMosaicProcessor.mosaicFaces(
-            bitmap = personCrop,
-          )
+      var savedCount = 0
+      var duplicateCount = 0
+      var failedCount = 0
 
-        Log.d(
-          TAG,
-          "Face mosaic completed: " +
-                  "detectedFaces=${mosaicResult.detectedFaceCount}, " +
-                  "mosaickedRegions=${mosaicResult.mosaickedRegionCount}, " +
-                  "fallback=${mosaicResult.usedFallback}",
-        )
+      validDetections.forEachIndexed { personIndex, detection ->
 
-        /*
-         * 저장은 IO 스레드에서 실행한다.
-         * 이 시점에는 YOLO lock이 이미 풀렸으므로
-         * 다음 사진 YOLO 또는 스트림 YOLO와 병렬로 실행될 수 있다.
-         */
-        val savedFile =
-          withContext(Dispatchers.IO) {
-            savePersonCrop(
-              bitmap = personCrop,
+        val personCropResult =
+          try {
+            cropPersonBitmap(
+              sourceBitmap = fullPhoto,
+              detection = detection,
             )
+          } catch (exception: Exception) {
+            failedCount += 1
+
+            Log.e(
+              TAG,
+              "Failed to crop person index=$personIndex",
+              exception,
+            )
+            return@forEachIndexed
           }
 
-        Log.d(
-          TAG,
-          "Mosaicked person crop saved: " +
-                  "${savedFile.absolutePath}, " +
-                  "size=${personCrop.width}x${personCrop.height}",
-        )
-      } finally {
-        if (!personCrop.isRecycled) {
-          personCrop.recycle()
+        val personCrop =
+          personCropResult.bitmap
+
+        try {
+          val mosaicResult =
+            faceLandmarkMosaicProcessor.mosaicFaces(
+              bitmap = personCrop,
+              poseKeypoints =
+                personCropResult.poseKeypoints,
+            )
+
+          Log.d(
+            TAG,
+            "Face landmark mosaic: " +
+                    "personIndex=$personIndex, " +
+                    "detectedFaces=${mosaicResult.detectedFaceCount}, " +
+                    "mosaickedFaces=${mosaicResult.mosaickedFaceCount}, " +
+                    "mosaickedRegions=${mosaicResult.mosaickedRegionCount}",
+          )
+
+          /*
+           * OSNet은 익명화 뒤에 실행한다.
+           * 얼굴이 보인 경우 눈·코·입 정보가 제거된 crop을 사용하므로
+           * 착장 중심 중복 판정이라는 목적에 더 잘 맞는다.
+           */
+          val embedding =
+            osNetReIdentifier.extractEmbedding(
+              personBitmap = personCrop,
+            )
+
+          val duplicateMatch =
+            osNetReIdentifier.findDuplicate(
+              embedding = embedding,
+            )
+
+          if (duplicateMatch != null) {
+            duplicateCount += 1
+
+            Log.d(
+              TAG,
+              "Duplicate person skipped: " +
+                      "personIndex=$personIndex, " +
+                      "matchedPersonId=${duplicateMatch.personId}, " +
+                      "similarity=${duplicateMatch.similarity}, " +
+                      "file=${duplicateMatch.savedFileName}",
+            )
+            return@forEachIndexed
+          }
+
+          val savedFile =
+            withContext(Dispatchers.IO) {
+              savePersonCrop(
+                bitmap = personCrop,
+                captureId = captureId,
+                personIndex = personIndex,
+              )
+            }
+
+          val personId =
+            osNetReIdentifier.registerSavedPerson(
+              embedding = embedding,
+              savedFileName = savedFile.name,
+            )
+
+          savedCount += 1
+
+          Log.d(
+            TAG,
+            "New anonymized person crop saved: " +
+                    "personIndex=$personIndex, " +
+                    "personId=$personId, " +
+                    "path=${savedFile.absolutePath}, " +
+                    "size=${personCrop.width}x${personCrop.height}",
+          )
+        } catch (exception: Exception) {
+          failedCount += 1
+
+          Log.e(
+            TAG,
+            "Person processing failed: index=$personIndex",
+            exception,
+          )
+        } finally {
+          if (!personCrop.isRecycled) {
+            personCrop.recycle()
+          }
         }
       }
+
+      _uiState.update {
+        it.copy(
+          pendingUploadCount =
+            batchCropUploader.countPendingFiles(),
+        )
+      }
+
+      Log.d(
+        TAG,
+        "High-resolution photo processing completed: " +
+                "valid=${validDetections.size}, " +
+                "saved=$savedCount, " +
+                "duplicates=$duplicateCount, " +
+                "failed=$failedCount, " +
+                "gallery=${osNetReIdentifier.getRegisteredPersonCount()}",
+      )
     } finally {
       if (!fullPhoto.isRecycled) {
         fullPhoto.recycle()
@@ -1821,19 +2057,16 @@ class StreamViewModel(
     }
   }
 
-  private fun selectLargestPerson(
-    detections: List<PoseDetection>,
-  ): PoseDetection? {
-    return detections.maxByOrNull { detection ->
-      detection.box.width() *
-              detection.box.height()
-    }
-  }
+
+  private data class PersonCropResult(
+    val bitmap: Bitmap,
+    val poseKeypoints: List<PoseKeypoint>,
+  )
 
   private fun cropPersonBitmap(
     sourceBitmap: Bitmap,
     detection: PoseDetection,
-  ): Bitmap {
+  ): PersonCropResult {
     val box =
       detection.box
 
@@ -1901,11 +2134,40 @@ class StreamViewModel(
       croppedBitmap.recycle()
     }
 
-    return copiedBitmap
+    /*
+     * Face Landmarker가 모자나 측면 얼굴을 놓칠 때 사용할 수 있도록
+     * YOLO pose 얼굴 키포인트를 사람 crop 좌표로 변환한다.
+     */
+    val mappedKeypoints =
+      detection.keypoints.map { keypoint ->
+        PoseKeypoint(
+          x =
+            (keypoint.x - left)
+              .coerceIn(
+                0f,
+                copiedBitmap.width.toFloat(),
+              ),
+          y =
+            (keypoint.y - top)
+              .coerceIn(
+                0f,
+                copiedBitmap.height.toFloat(),
+              ),
+          confidence =
+            keypoint.confidence,
+        )
+      }
+
+    return PersonCropResult(
+      bitmap = copiedBitmap,
+      poseKeypoints = mappedKeypoints,
+    )
   }
 
   private fun savePersonCrop(
     bitmap: Bitmap,
+    captureId: Long,
+    personIndex: Int,
   ): File {
     val context =
       getApplication<Application>()
@@ -1930,7 +2192,7 @@ class StreamViewModel(
     val outputFile =
       File(
         cropDirectory,
-        "person_mosaic_${System.currentTimeMillis()}.jpg",
+        "capture_${captureId}_person_${personIndex.toString().padStart(2, '0')}.jpg",
       )
 
     FileOutputStream(outputFile).use { outputStream ->
@@ -2093,8 +2355,10 @@ class StreamViewModel(
   override fun onCleared() {
     batchCropUploader.cancelAll()
     stopStream()
-    faceMosaicProcessor.close()
-    yoloPoseModel.close()
+    faceLandmarkMosaicProcessor.close()
+    osNetReIdentifier.close()
+    realtimeYoloPoseModel.close()
+    highResYoloPoseModel.close()
     super.onCleared()
   }
 

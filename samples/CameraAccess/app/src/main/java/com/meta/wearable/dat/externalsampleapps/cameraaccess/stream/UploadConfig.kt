@@ -7,5 +7,5 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.stream
  * 휴대폰과 데스크톱은 같은 Wi-Fi에 연결되어 있어야 한다.
  */
 object UploadConfig {
-  const val SERVER_BASE_URL = "http://192.168.0.24:8000"
+  const val SERVER_BASE_URL = "http://192.168.0.68:8000"
 }
