@@ -40,6 +40,7 @@ import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
+import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -115,8 +116,32 @@ class StreamViewModel(
    * 익명화된 사람 crop에서 OSNet 특징을 추출하고,
    * 이미 저장한 사람과 중복인지 판단한다.
    */
-  private val osNetReIdentifier =
+  private var osNetReIdentifier =
     OsNetReIdentifier(getApplication())
+
+  private var hasStartedCollectionSession =
+    false
+
+  /*
+   * 수집 세션/샘플 metadata는 작은 JSON sidecar로만 기록한다.
+   * Android에서는 CSV나 SQLite를 쓰지 않는다.
+   */
+  private val collectionMetadataStore =
+    CollectionMetadataStore(getApplication())
+
+  private val phoneLocationProvider =
+    PhoneLocationProvider(getApplication())
+
+  private var activeCollectionSession: CollectionSession? =
+    null
+
+  /*
+   * OSNet 자체의 중복 판정 로직은 건드리지 않는다.
+   * 저장된 신규 인물 embedding만 이 목록에 복사해 두고
+   * metadata용 max cosine similarity를 별도로 계산한다.
+   */
+  private val metadataEmbeddingGallery =
+    mutableListOf<FloatArray>()
 
   // 저장된 모자이크 crop 전체를 데스크톱으로 전송한다.
   private val batchCropUploader =
@@ -169,8 +194,13 @@ class StreamViewModel(
   private val autoPhotoQueueLock =
     Any()
 
+  private data class QueuedAutoPhoto(
+    val bitmap: Bitmap,
+    val capturedAtEpochMs: Long,
+  )
+
   private val autoPhotoQueue =
-    ArrayDeque<Bitmap>()
+    ArrayDeque<QueuedAutoPhoto>()
 
   private var autoPhotoProcessorJob: Job? =
     null
@@ -249,7 +279,158 @@ class StreamViewModel(
   private var presentationQueue: PresentationQueue? =
     null
 
+  fun updatePlaceName(value: String) {
+    if (_uiState.value.isCollectionSessionActive) {
+      return
+    }
+
+    _uiState.update {
+      it.copy(placeName = value)
+    }
+  }
+
+  fun onLocationPermissionDenied() {
+    _uiState.update {
+      it.copy(
+        isLocationLoading = false,
+        locationStatusText =
+          "정확한 위치 권한이 필요합니다. 권한을 허용한 뒤 다시 시도하세요.",
+      )
+    }
+  }
+
+  fun fetchCurrentGps() {
+    if (_uiState.value.isCollectionSessionActive) {
+      return
+    }
+
+    _uiState.update {
+      it.copy(
+        isLocationLoading = true,
+        locationStatusText = "GPS 위치를 확인하는 중입니다...",
+      )
+    }
+
+    viewModelScope.launch {
+      val result =
+        phoneLocationProvider.getCurrentGpsLocation()
+
+      result
+        .onSuccess { location ->
+          _uiState.update {
+            it.copy(
+              gpsLatitude = location.latitude,
+              gpsLongitude = location.longitude,
+              gpsAccuracyM = location.accuracyMeters,
+              isLocationLoading = false,
+              locationStatusText =
+                "GPS 위치를 저장했습니다. 정확도 ±${"%.1f".format(location.accuracyMeters)} m",
+            )
+          }
+        }
+        .onFailure { error ->
+          _uiState.update {
+            it.copy(
+              isLocationLoading = false,
+              locationStatusText =
+                error.message ?: "GPS 위치를 가져오지 못했습니다.",
+            )
+          }
+        }
+    }
+  }
+
+  fun startCollectionSession() {
+    if (_uiState.value.isCollectionSessionActive) {
+      return
+    }
+
+    val state = _uiState.value
+    val latitude = state.gpsLatitude
+    val longitude = state.gpsLongitude
+    val accuracy = state.gpsAccuracyM
+
+    if (state.placeName.isBlank()) {
+      _uiState.update {
+        it.copy(locationStatusText = "장소명을 입력하세요.")
+      }
+      return
+    }
+
+    if (latitude == null || longitude == null || accuracy == null) {
+      _uiState.update {
+        it.copy(locationStatusText = "먼저 현재 GPS를 가져오세요.")
+      }
+      return
+    }
+
+    val session =
+      try {
+        collectionMetadataStore.createSession(
+          placeName = state.placeName,
+          location =
+            LocationSnapshot(
+              latitude = latitude,
+              longitude = longitude,
+              accuracyMeters = accuracy,
+            ),
+        )
+      } catch (exception: Exception) {
+        _uiState.update {
+          it.copy(
+            locationStatusText =
+              "수집 세션을 만들지 못했습니다: " +
+                      (exception.message ?: exception.javaClass.simpleName),
+          )
+        }
+        return
+      }
+
+    if (hasStartedCollectionSession) {
+      osNetReIdentifier.close()
+      osNetReIdentifier =
+        OsNetReIdentifier(getApplication())
+    }
+
+    hasStartedCollectionSession = true
+    activeCollectionSession = session
+    metadataEmbeddingGallery.clear()
+
+    _uiState.update {
+      it.copy(
+        isCollectionSessionActive = true,
+        batchId = session.batchId,
+        placeName = session.placeName,
+        gpsLatitude = session.gpsLatitude,
+        gpsLongitude = session.gpsLongitude,
+        gpsAccuracyM = session.gpsAccuracyM,
+        locationStatusText = null,
+        uploadStatusText = null,
+        pendingUploadCount = 0,
+      )
+    }
+
+    startStream()
+  }
+
+  private fun countPendingForActiveSession(): Int {
+    val batchId = activeCollectionSession?.batchId
+    return if (batchId == null) {
+      0
+    } else {
+      batchCropUploader.countPendingFiles(batchId)
+    }
+  }
+
   fun startStream() {
+    if (activeCollectionSession == null) {
+      _uiState.update {
+        it.copy(
+          uploadStatusText = "장소와 GPS를 설정한 뒤 수집을 시작하세요.",
+        )
+      }
+      return
+    }
     if (isStoppingOrUploading.get()) {
       Log.w(
         TAG,
@@ -262,7 +443,7 @@ class StreamViewModel(
       it.copy(
         uploadStatusText = null,
         pendingUploadCount =
-          batchCropUploader.countPendingFiles(),
+          countPendingForActiveSession(),
         shouldNavigateAfterUpload = false,
       )
     }
@@ -402,7 +583,7 @@ class StreamViewModel(
             session
               ?.addStream(
                 StreamConfiguration(
-                  videoQuality = VideoQuality.HIGH,
+                  videoQuality = VideoQuality.MEDIUM,
                   frameRate = 2,
                 ),
               )
@@ -698,6 +879,17 @@ class StreamViewModel(
           isPhotoCaptureRunning.set(false)
           pendingAutoPhotoCount.set(0)
 
+          val currentSession =
+            activeCollectionSession
+              ?: throw IllegalStateException(
+                "활성 수집 세션이 없습니다.",
+              )
+
+          activeCollectionSession =
+            withContext(Dispatchers.IO) {
+              collectionMetadataStore.finalizeSession(currentSession)
+            }
+
           closeStreamSessionForUpload()
 
           uploadAllSavedPhotosInternal()
@@ -718,7 +910,7 @@ class StreamViewModel(
                         (exception.message
                           ?: exception.javaClass.simpleName),
               pendingUploadCount =
-                batchCropUploader.countPendingFiles(),
+                countPendingForActiveSession(),
             )
           }
         } finally {
@@ -770,7 +962,7 @@ class StreamViewModel(
                         (exception.message
                           ?: exception.javaClass.simpleName),
               pendingUploadCount =
-                batchCropUploader.countPendingFiles(),
+                countPendingForActiveSession(),
             )
           }
         } finally {
@@ -790,7 +982,7 @@ class StreamViewModel(
 
   private suspend fun uploadAllSavedPhotosInternal() {
     val pendingCount =
-      batchCropUploader.countPendingFiles()
+      countPendingForActiveSession()
 
     _uiState.update {
       it.copy(
@@ -805,11 +997,33 @@ class StreamViewModel(
       )
     }
 
+    val currentSession =
+      activeCollectionSession
+
+    if (currentSession == null) {
+      _uiState.update {
+        it.copy(
+          isUploading = false,
+          uploadStatusText = "활성 수집 세션이 없습니다.",
+        )
+      }
+      return
+    }
+
+    val finalizedSession =
+      if (currentSession.sessionEndTime == null) {
+        withContext(Dispatchers.IO) {
+          collectionMetadataStore.finalizeSession(currentSession)
+        }.also { activeCollectionSession = it }
+      } else {
+        currentSession
+      }
+
     val result =
-      batchCropUploader.uploadPendingCrops()
+      batchCropUploader.uploadPendingCrops(finalizedSession)
 
     val remainingCount =
-      batchCropUploader.countPendingFiles()
+      countPendingForActiveSession()
 
     _uiState.update {
       it.copy(
@@ -1092,6 +1306,9 @@ class StreamViewModel(
                 return@onSuccess
               }
 
+            val capturedAtEpochMs =
+              System.currentTimeMillis()
+
             val successAtMs =
               SystemClock.elapsedRealtime()
 
@@ -1149,6 +1366,7 @@ class StreamViewModel(
             if (isAutomatic) {
               enqueueAutoCapturedPhoto(
                 capturedBitmap = capturedBitmap,
+                capturedAtEpochMs = capturedAtEpochMs,
               )
             } else {
               launchManualCapturedPhotoProcessing(
@@ -1195,11 +1413,15 @@ class StreamViewModel(
    */
   private fun enqueueAutoCapturedPhoto(
     capturedBitmap: Bitmap,
+    capturedAtEpochMs: Long,
   ) {
     val queueSize =
       synchronized(autoPhotoQueueLock) {
         autoPhotoQueue.addLast(
-          capturedBitmap,
+          QueuedAutoPhoto(
+            bitmap = capturedBitmap,
+            capturedAtEpochMs = capturedAtEpochMs,
+          ),
         )
 
         autoPhotoQueue.size
@@ -1251,13 +1473,14 @@ class StreamViewModel(
 
             try {
               processAutoCapturedPhoto(
-                fullPhoto = nextPhoto,
+                fullPhoto = nextPhoto.bitmap,
+                captureTimestampMs = nextPhoto.capturedAtEpochMs,
               )
             } catch (
               exception: CancellationException
             ) {
-              if (!nextPhoto.isRecycled) {
-                nextPhoto.recycle()
+              if (!nextPhoto.bitmap.isRecycled) {
+                nextPhoto.bitmap.recycle()
               }
 
               throw exception
@@ -1270,8 +1493,8 @@ class StreamViewModel(
                 exception,
               )
 
-              if (!nextPhoto.isRecycled) {
-                nextPhoto.recycle()
+              if (!nextPhoto.bitmap.isRecycled) {
+                nextPhoto.bitmap.recycle()
               }
             } finally {
               releaseAutoPhotoSlot()
@@ -1454,9 +1677,9 @@ class StreamViewModel(
         }
       }
 
-    queuedPhotos.forEach { bitmap ->
-      if (!bitmap.isRecycled) {
-        bitmap.recycle()
+    queuedPhotos.forEach { queuedPhoto ->
+      if (!queuedPhoto.bitmap.isRecycled) {
+        queuedPhoto.bitmap.recycle()
       }
     }
 
@@ -1816,6 +2039,7 @@ class StreamViewModel(
    */
   private suspend fun processAutoCapturedPhoto(
     fullPhoto: Bitmap,
+    captureTimestampMs: Long,
   ) {
     try {
       Log.d(
@@ -1856,7 +2080,13 @@ class StreamViewModel(
       }
 
       val captureId =
-        System.currentTimeMillis()
+        captureTimestampMs
+
+      val collectionSession =
+        activeCollectionSession
+          ?: throw IllegalStateException(
+            "활성 수집 세션이 없습니다.",
+          )
 
       var savedCount = 0
       var duplicateCount = 0
@@ -1911,6 +2141,9 @@ class StreamViewModel(
               personBitmap = personCrop,
             )
 
+          val osnetMaxSimilarity =
+            computeMaxCosineSimilarity(embedding)
+
           val duplicateMatch =
             osNetReIdentifier.findDuplicate(
               embedding = embedding,
@@ -1936,14 +2169,43 @@ class StreamViewModel(
                 bitmap = personCrop,
                 captureId = captureId,
                 personIndex = personIndex,
+                batchId = collectionSession.batchId,
               )
             }
+
+          try {
+            val sampleMetadata =
+              buildSampleMetadata(
+                session = collectionSession,
+                imageFilename = savedFile.name,
+                captureTimestampMs = captureId,
+                sourceWidth = fullPhoto.width,
+                sourceHeight = fullPhoto.height,
+                cropWidth = personCrop.width,
+                cropHeight = personCrop.height,
+                detection = detection,
+                osnetMaxSimilarity = osnetMaxSimilarity,
+              )
+
+            withContext(Dispatchers.IO) {
+              collectionMetadataStore.saveSampleMetadata(sampleMetadata)
+            }
+          } catch (exception: Exception) {
+            withContext(Dispatchers.IO) {
+              savedFile.delete()
+            }
+            throw exception
+          }
 
           val personId =
             osNetReIdentifier.registerSavedPerson(
               embedding = embedding,
               savedFileName = savedFile.name,
             )
+
+          metadataEmbeddingGallery.add(
+            embedding.copyOf(),
+          )
 
           savedCount += 1
 
@@ -1973,7 +2235,7 @@ class StreamViewModel(
       _uiState.update {
         it.copy(
           pendingUploadCount =
-            batchCropUploader.countPendingFiles(),
+            countPendingForActiveSession(),
         )
       }
 
@@ -2168,6 +2430,7 @@ class StreamViewModel(
     bitmap: Bitmap,
     captureId: Long,
     personIndex: Int,
+    batchId: String,
   ): File {
     val context =
       getApplication<Application>()
@@ -2179,8 +2442,11 @@ class StreamViewModel(
 
     val cropDirectory =
       File(
-        baseDirectory,
-        "person_crops_mosaicked",
+        File(
+          baseDirectory,
+          "person_crops_mosaicked",
+        ),
+        batchId,
       ).apply {
         if (!exists() && !mkdirs()) {
           throw IOException(
@@ -2211,6 +2477,128 @@ class StreamViewModel(
     }
 
     return outputFile
+  }
+
+  private fun buildSampleMetadata(
+    session: CollectionSession,
+    imageFilename: String,
+    captureTimestampMs: Long,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    cropWidth: Int,
+    cropHeight: Int,
+    detection: PoseDetection,
+    osnetMaxSimilarity: Float?,
+  ): SampleMetadata {
+    val sourceWidthF = sourceWidth.toFloat().coerceAtLeast(1f)
+    val sourceHeightF = sourceHeight.toFloat().coerceAtLeast(1f)
+
+    val x1 =
+      (detection.box.left / sourceWidthF).coerceIn(0f, 1f)
+    val y1 =
+      (detection.box.top / sourceHeightF).coerceIn(0f, 1f)
+    val x2 =
+      (detection.box.right / sourceWidthF).coerceIn(0f, 1f)
+    val y2 =
+      (detection.box.bottom / sourceHeightF).coerceIn(0f, 1f)
+
+    val areaRatio =
+      ((detection.box.width().coerceAtLeast(0f) *
+              detection.box.height().coerceAtLeast(0f)) /
+              (sourceWidthF * sourceHeightF))
+        .coerceIn(0f, 1f)
+
+    fun confidence(index: Int): Float =
+      detection.keypoints
+        .getOrNull(index)
+        ?.confidence
+        ?: 0f
+
+    /*
+     * 좌/우를 각각 저장하지 않고 관절 그룹별 가장 잘 보이는 점 하나를 사용한다.
+     * shoulders / hips / knees / ankles의 4개 품질값을 평균·최솟값으로 압축한다.
+     */
+    val poseGroupConfidences =
+      listOf(
+        max(confidence(5), confidence(6)),
+        max(confidence(11), confidence(12)),
+        max(confidence(13), confidence(14)),
+        max(confidence(15), confidence(16)),
+      )
+
+    val poseMean =
+      poseGroupConfidences.average().toFloat()
+
+    val poseMin =
+      poseGroupConfidences.minOrNull() ?: 0f
+
+    return SampleMetadata(
+      batchId = session.batchId,
+      sampleId =
+        collectionMetadataStore.nextSampleId(session.batchId),
+      imageFilename = imageFilename,
+      captureTimestamp =
+        collectionMetadataStore.timestampFromEpochMillis(captureTimestampMs),
+      sourceWidth = sourceWidth,
+      sourceHeight = sourceHeight,
+      cropWidth = cropWidth,
+      cropHeight = cropHeight,
+      yoloConfidence = detection.confidence,
+      bboxX1Norm = x1,
+      bboxY1Norm = y1,
+      bboxX2Norm = x2,
+      bboxY2Norm = y2,
+      bboxAreaRatio = areaRatio,
+      poseMeanConfidence = poseMean,
+      poseMinConfidence = poseMin,
+      osnetMaxSimilarity = osnetMaxSimilarity,
+    )
+  }
+
+  private fun computeMaxCosineSimilarity(
+    embedding: FloatArray,
+  ): Float? {
+    if (metadataEmbeddingGallery.isEmpty()) {
+      return null
+    }
+
+    return metadataEmbeddingGallery
+      .maxOfOrNull { previous ->
+        cosineSimilarity(embedding, previous)
+      }
+  }
+
+  private fun cosineSimilarity(
+    first: FloatArray,
+    second: FloatArray,
+  ): Float {
+    val size = minOf(first.size, second.size)
+    if (size == 0) {
+      return 0f
+    }
+
+    var dot = 0.0
+    var firstNorm = 0.0
+    var secondNorm = 0.0
+
+    for (index in 0 until size) {
+      val a = first[index].toDouble()
+      val b = second[index].toDouble()
+      dot += a * b
+      firstNorm += a * a
+      secondNorm += b * b
+    }
+
+    val denominator =
+      sqrt(firstNorm) * sqrt(secondNorm)
+
+    if (denominator <= 0.0) {
+      return 0f
+    }
+
+    return (dot / denominator)
+      .toFloat()
+      .coerceIn(-1f, 1f)
   }
 
   private fun decodeHeic(

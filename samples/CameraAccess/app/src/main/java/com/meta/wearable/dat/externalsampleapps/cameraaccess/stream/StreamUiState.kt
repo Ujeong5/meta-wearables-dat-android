@@ -14,4 +14,14 @@ data class StreamUiState(
     val uploadStatusText: String? = null,
     val pendingUploadCount: Int = 0,
     val shouldNavigateAfterUpload: Boolean = false,
+
+    // 데이터 수집 세션 설정
+    val placeName: String = "",
+    val gpsLatitude: Double? = null,
+    val gpsLongitude: Double? = null,
+    val gpsAccuracyM: Float? = null,
+    val isLocationLoading: Boolean = false,
+    val locationStatusText: String? = null,
+    val isCollectionSessionActive: Boolean = false,
+    val batchId: String? = null,
 )

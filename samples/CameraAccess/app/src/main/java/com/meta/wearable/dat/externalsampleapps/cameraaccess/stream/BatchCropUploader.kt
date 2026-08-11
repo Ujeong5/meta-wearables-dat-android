@@ -5,7 +5,6 @@ import android.os.Environment
 import android.util.Log
 import java.io.File
 import java.io.IOException
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -17,11 +16,10 @@ import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONObject
 
 /**
- * person_crops_mosaicked 폴더의 모든 JPEG를 하나의 multipart/form-data 요청으로 전송한다.
+ * 한 수집 세션(batch)의 모자이크 crop과 metadata를 한 번에 전송한다.
  *
- * 서버가 모든 파일 저장 성공을 확인한 경우에만 휴대폰 파일을
- * person_crops_uploaded/<batchId> 폴더로 옮긴다.
- * 요청이 실패하면 원본 파일은 그대로 남아 재전송할 수 있다.
+ * Android에서는 CSV를 쓰지 않는다.
+ * 각 crop의 작은 JSON sidecar만 저장하고, CSV/SQLite는 Windows가 만든다.
  */
 class BatchCropUploader(
   private val context: Context,
@@ -32,7 +30,12 @@ class BatchCropUploader(
     private const val TAG = "CameraAccess:BatchUploader"
     private const val PENDING_FOLDER_NAME = "person_crops_mosaicked"
     private const val UPLOADED_FOLDER_NAME = "person_crops_uploaded"
+    private const val METADATA_FOLDER_NAME = "person_crop_metadata"
+    private const val UPLOADED_METADATA_FOLDER_NAME = "person_crop_metadata_uploaded"
   }
+
+  private val metadataStore =
+    CollectionMetadataStore(context)
 
   private val jpegMediaType =
     "image/jpeg".toMediaType()
@@ -45,34 +48,81 @@ class BatchCropUploader(
       .retryOnConnectionFailure(false)
       .build()
 
-  fun countPendingFiles(): Int {
-    return getPendingFiles().size
+  fun countPendingFiles(batchId: String? = null): Int {
+    return if (batchId != null) {
+      getPendingFiles(batchId).size
+    } else {
+      val root =
+        File(
+          getPicturesBaseDirectory(),
+          PENDING_FOLDER_NAME,
+        )
+
+      if (!root.exists()) {
+        0
+      } else {
+        root.walkTopDown().count { file ->
+          file.isFile && file.extension.lowercase() in setOf("jpg", "jpeg")
+        }
+      }
+    }
   }
 
-  suspend fun uploadPendingCrops(): BatchUploadResult =
+  suspend fun uploadPendingCrops(
+    session: CollectionSession,
+  ): BatchUploadResult =
     withContext(Dispatchers.IO) {
       val files =
-        getPendingFiles()
+        getPendingFiles(session.batchId)
 
       if (files.isEmpty()) {
         return@withContext BatchUploadResult(
           success = true,
           requestedCount = 0,
           transferredCount = 0,
-          batchId = null,
+          batchId = session.batchId,
           message = "전송할 저장 사진이 없습니다.",
         )
       }
 
-      val batchId =
-        createDeterministicBatchId(files)
+      val samples =
+        metadataStore.loadSampleMetadata(session.batchId)
+
+      val sampleByFilename =
+        samples.associateBy { it.imageFilename }
+
+      val expectedFileNames =
+        files.map { it.name }.toSet()
+
+      val metadataFileNames =
+        sampleByFilename.keys
+
+      if (metadataFileNames != expectedFileNames) {
+        return@withContext BatchUploadResult(
+          success = false,
+          requestedCount = files.size,
+          transferredCount = 0,
+          batchId = session.batchId,
+          message =
+            "사진과 sample metadata가 일치하지 않습니다. " +
+                    "images=${expectedFileNames.size}, metadata=${metadataFileNames.size}",
+        )
+      }
 
       val multipartBuilder =
         MultipartBody.Builder()
           .setType(MultipartBody.FORM)
           .addFormDataPart(
             "batch_id",
-            batchId,
+            session.batchId,
+          )
+          .addFormDataPart(
+            "batch_metadata",
+            session.toJson().toString(),
+          )
+          .addFormDataPart(
+            "samples_json",
+            samplesToJsonArray(samples).toString(),
           )
 
       files.forEach { file ->
@@ -91,13 +141,6 @@ class BatchCropUploader(
           .post(multipartBuilder.build())
           .build()
 
-      Log.d(
-        TAG,
-        "Starting batch upload: " +
-          "batchId=$batchId, files=${files.size}, " +
-          "bytes=${files.sumOf { it.length() }}",
-      )
-
       try {
         client.newCall(request).execute().use { response ->
           val responseText =
@@ -108,10 +151,10 @@ class BatchCropUploader(
               success = false,
               requestedCount = files.size,
               transferredCount = 0,
-              batchId = batchId,
+              batchId = session.batchId,
               message =
                 "서버가 HTTP ${response.code}로 응답했습니다. " +
-                  responseText.take(300),
+                        responseText.take(300),
             )
           }
 
@@ -123,7 +166,7 @@ class BatchCropUploader(
                 success = false,
                 requestedCount = files.size,
                 transferredCount = 0,
-                batchId = batchId,
+                batchId = session.batchId,
                 message = "서버 응답 JSON을 읽지 못했습니다.",
               )
             }
@@ -149,12 +192,9 @@ class BatchCropUploader(
               }
             }
 
-          val expectedFileNames =
-            files.map { it.name }.toSet()
-
           if (
             !ok ||
-            responseBatchId != batchId ||
+            responseBatchId != session.batchId ||
             savedCount != files.size ||
             savedFileNames != expectedFileNames
           ) {
@@ -162,29 +202,24 @@ class BatchCropUploader(
               success = false,
               requestedCount = files.size,
               transferredCount = savedCount.coerceAtLeast(0),
-              batchId = batchId,
+              batchId = session.batchId,
               message =
                 "서버의 저장 확인 내용이 휴대폰 파일 목록과 일치하지 않습니다.",
             )
           }
 
-          moveUploadedFiles(
+          moveUploadedBatch(
+            batchId = session.batchId,
             files = files,
-            batchId = batchId,
-          )
-
-          Log.d(
-            TAG,
-            "Batch upload completed: " +
-              "batchId=$batchId, files=${files.size}",
           )
 
           BatchUploadResult(
             success = true,
             requestedCount = files.size,
             transferredCount = files.size,
-            batchId = batchId,
-            message = "사진 ${files.size}장을 데스크톱으로 전송했습니다.",
+            batchId = session.batchId,
+            message =
+              "${session.placeName}: 사진 ${files.size}장을 데스크톱으로 전송했습니다.",
           )
         }
       } catch (exception: IOException) {
@@ -198,10 +233,10 @@ class BatchCropUploader(
           success = false,
           requestedCount = files.size,
           transferredCount = 0,
-          batchId = batchId,
+          batchId = session.batchId,
           message =
             "데스크톱 서버에 연결하지 못했습니다: " +
-              (exception.message ?: exception.javaClass.simpleName),
+                    (exception.message ?: exception.javaClass.simpleName),
         )
       }
     }
@@ -210,11 +245,14 @@ class BatchCropUploader(
     client.dispatcher.cancelAll()
   }
 
-  private fun getPendingFiles(): List<File> {
+  private fun getPendingFiles(batchId: String): List<File> {
     val directory =
       File(
-        getPicturesBaseDirectory(),
-        PENDING_FOLDER_NAME,
+        File(
+          getPicturesBaseDirectory(),
+          PENDING_FOLDER_NAME,
+        ),
+        batchId,
       )
 
     if (!directory.exists()) {
@@ -224,7 +262,7 @@ class BatchCropUploader(
     return directory
       .listFiles { file ->
         file.isFile &&
-          file.extension.lowercase() in setOf("jpg", "jpeg")
+                file.extension.lowercase() in setOf("jpg", "jpeg")
       }
       ?.sortedBy { it.name }
       .orEmpty()
@@ -236,79 +274,93 @@ class BatchCropUploader(
     ) ?: context.filesDir
   }
 
-  private fun createDeterministicBatchId(
-    files: List<File>,
-  ): String {
-    val digest =
-      MessageDigest.getInstance("SHA-256")
-
-    files.forEach { file ->
-      val description =
-        "${file.name}:${file.length()}\n"
-
-      digest.update(
-        description.toByteArray(Charsets.UTF_8),
-      )
-    }
-
-    return digest
-      .digest()
-      .joinToString(separator = "") { byte ->
-        "%02x".format(byte)
-      }
-      .take(24)
-  }
-
-  private fun moveUploadedFiles(
-    files: List<File>,
+  private fun moveUploadedBatch(
     batchId: String,
+    files: List<File>,
   ) {
+    val base =
+      getPicturesBaseDirectory()
+
     val uploadedDirectory =
       File(
-        File(
-          getPicturesBaseDirectory(),
-          UPLOADED_FOLDER_NAME,
-        ),
+        File(base, UPLOADED_FOLDER_NAME),
         batchId,
       )
 
-    if (
-      !uploadedDirectory.exists() &&
-      !uploadedDirectory.mkdirs()
-    ) {
+    if (!uploadedDirectory.exists() && !uploadedDirectory.mkdirs()) {
       throw IOException(
-        "전송 완료 폴더를 만들지 못했습니다: " +
-          uploadedDirectory.absolutePath,
+        "전송 완료 폴더를 만들지 못했습니다: ${uploadedDirectory.absolutePath}",
       )
     }
 
     files.forEach { sourceFile ->
-      val targetFile =
+      moveFile(
+        sourceFile,
+        File(uploadedDirectory, sourceFile.name),
+      )
+    }
+
+    val metadataSourceDirectory =
+      File(
+        File(base, METADATA_FOLDER_NAME),
+        batchId,
+      )
+
+    if (metadataSourceDirectory.exists()) {
+      val metadataTargetDirectory =
         File(
-          uploadedDirectory,
-          sourceFile.name,
+          File(base, UPLOADED_METADATA_FOLDER_NAME),
+          batchId,
         )
 
-      if (targetFile.exists() && !targetFile.delete()) {
+      if (
+        !metadataTargetDirectory.exists() &&
+        !metadataTargetDirectory.mkdirs()
+      ) {
         throw IOException(
-          "기존 전송 완료 파일을 교체하지 못했습니다: " +
-            targetFile.absolutePath,
+          "metadata 전송 완료 폴더를 만들지 못했습니다: " +
+                  metadataTargetDirectory.absolutePath,
         )
       }
 
-      if (!sourceFile.renameTo(targetFile)) {
-        sourceFile.copyTo(
-          target = targetFile,
-          overwrite = true,
-        )
-
-        if (!sourceFile.delete()) {
-          targetFile.delete()
-          throw IOException(
-            "원본 파일을 전송 완료 폴더로 이동하지 못했습니다: " +
-              sourceFile.absolutePath,
+      metadataSourceDirectory
+        .listFiles()
+        .orEmpty()
+        .filter { it.isFile }
+        .forEach { sourceFile ->
+          moveFile(
+            sourceFile,
+            File(metadataTargetDirectory, sourceFile.name),
           )
         }
+
+      metadataSourceDirectory.delete()
+    }
+
+    files.firstOrNull()?.parentFile?.delete()
+  }
+
+  private fun moveFile(
+    sourceFile: File,
+    targetFile: File,
+  ) {
+    if (targetFile.exists() && !targetFile.delete()) {
+      throw IOException(
+        "기존 파일을 교체하지 못했습니다: ${targetFile.absolutePath}",
+      )
+    }
+
+    if (!sourceFile.renameTo(targetFile)) {
+      sourceFile.copyTo(
+        target = targetFile,
+        overwrite = true,
+      )
+
+      if (!sourceFile.delete()) {
+        targetFile.delete()
+        throw IOException(
+          "원본 파일을 이동하지 못했습니다: ${sourceFile.absolutePath}",
+        )
       }
     }
   }
